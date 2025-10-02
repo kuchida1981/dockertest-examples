@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  testenv:
+    image: golang:latest
+    working_dir: /app
+    volumes:
+      - .:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - DOCKER_HOST_ADDR=host.docker.internal
+    command: go test -v ./...

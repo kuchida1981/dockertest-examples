@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 
@@ -12,21 +13,29 @@ import (
 	"github.com/ory/dockertest/v3/docker"
 )
 
-func TestStdout(t *testing.T) {
-	pool, err := dockertest.NewPool("")
+var pool *dockertest.Pool
+
+func TestMain(m *testing.M) {
+	var err error
+	pool, err = dockertest.NewPool("")
 	if err != nil {
 		log.Fatalf("could not construct pool: %s", err)
 	}
 
-	pool.Client.Ping()
-	if err != nil {
+	if err = pool.Client.Ping(); err != nil {
 		log.Fatalf("could not connect to Docker: %s", err)
 	}
 
+	m.Run()
+}
+
+func TestStdout(t *testing.T) {
+
 	resource, err := pool.Run("hello-world", "latest", []string{})
 	if err != nil {
-		log.Fatalf("could not start resource: %s", err)
+		t.Fatalf("could not start resource: %s", err)
 	}
+	defer pool.Purge(resource)
 
 	// ログを取得
 	var logBuffer bytes.Buffer
@@ -38,49 +47,42 @@ func TestStdout(t *testing.T) {
 		Stderr:       true,
 	})
 	if err != nil {
-		log.Fatalf("could not get logs: %s", err)
+		t.Fatalf("could not get logs: %s", err)
 	}
 
 	output := logBuffer.String()
 	// "Hello from Docker!" が含まれるか確認
 	if !strings.Contains(output, "Hello from Docker!") {
-		log.Fatalf("not contained 'Hello from Docker!' in output: %s", output)
+		t.Fatalf("not contained 'Hello from Docker!' in output: %s", output)
 	}
-
-	// クリーンアップ
-	if err := pool.Purge(resource); err != nil {
-		log.Fatalf("could not purge resource: %s", err)
-	}
-
 }
 
 func TestNginx(t *testing.T) {
-	pool, err := dockertest.NewPool("")
-	if err != nil {
-		t.Fatalf("could not construct pool: %s", err)
-	}
-
-	if err := pool.Client.Ping(); err != nil {
-		t.Fatalf("could not connect to Docker: %s", err)
-	}
 
 	// nginxコンテナを起動
 	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
-		Repository: "nginx",
-		Tag:        "latest",
-	}, func(config *docker.HostConfig) {
-		config.PortBindings = map[docker.Port][]docker.PortBinding{
-			"80/tcp": {{HostPort: "8080"}},
-		}
+		Repository:   "nginx",
+		Tag:          "latest",
+		ExposedPorts: []string{"80/tcp"},
 	})
 	if err != nil {
 		t.Fatalf("could not start resource: %s", err)
 	}
 	defer pool.Purge(resource)
 
+	// 動的に割り当てられたポートを取得
+	hostPort := resource.GetPort("80/tcp")
+
+	// Docker Compose内で実行する場合はhost.docker.internalを使用
+	dockerHost := os.Getenv("DOCKER_HOST_ADDR")
+	if dockerHost == "" {
+		dockerHost = "localhost"
+	}
+	url := fmt.Sprintf("http://%s:%s", dockerHost, hostPort)
+
 	// nginxが起動するまで待機してリトライ
 	if err := pool.Retry(func() error {
-		resp, err := http.Get("http://localhost:8080")
+		resp, err := http.Get(url)
 		if err != nil {
 			return err
 		}
@@ -95,7 +97,7 @@ func TestNginx(t *testing.T) {
 	}
 
 	// GET / リクエストしてステータス200を確認
-	resp, err := http.Get("http://localhost:8080")
+	resp, err := http.Get(url)
 	if err != nil {
 		t.Fatalf("could not make request: %s", err)
 	}
