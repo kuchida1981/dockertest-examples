@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -105,5 +107,116 @@ func TestNginx(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+}
+
+func TestMultipleServices(t *testing.T) {
+	// サービスBを起動
+	pwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %s", err)
+	}
+
+	serviceBResource, err := pool.BuildAndRunWithOptions(
+		filepath.Join(pwd, "service-b", "Dockerfile"),
+		&dockertest.RunOptions{
+			Name:         "service-b",
+			ExposedPorts: []string{"8080/tcp"},
+		},
+		func(config *docker.HostConfig) {
+			config.AutoRemove = true
+		},
+	)
+	if err != nil {
+		t.Fatalf("could not start service B: %s", err)
+	}
+	defer pool.Purge(serviceBResource)
+
+	serviceBPort := serviceBResource.GetPort("8080/tcp")
+
+	// Docker Compose内で実行する場合はhost.docker.internalを使用
+	dockerHost := os.Getenv("DOCKER_HOST_ADDR")
+	if dockerHost == "" {
+		dockerHost = "localhost"
+	}
+
+	serviceBURL := fmt.Sprintf("http://%s:%s", dockerHost, serviceBPort)
+
+	// サービスBが起動するまで待機
+	if err := pool.Retry(func() error {
+		resp, err := http.Get(serviceBURL)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		return nil
+	}); err != nil {
+		t.Fatalf("could not connect to service B: %s", err)
+	}
+
+	// サービスAを起動（サービスBのURLを環境変数で渡す）
+	serviceAResource, err := pool.BuildAndRunWithOptions(
+		filepath.Join(pwd, "service-a", "Dockerfile"),
+		&dockertest.RunOptions{
+			Name:         "service-a",
+			ExposedPorts: []string{"8080/tcp"},
+			Env: []string{
+				fmt.Sprintf("SERVICE_B_URL=%s", serviceBURL),
+			},
+		},
+		func(config *docker.HostConfig) {
+			config.AutoRemove = true
+		},
+	)
+	if err != nil {
+		t.Fatalf("could not start service A: %s", err)
+	}
+	defer pool.Purge(serviceAResource)
+
+	serviceAPort := serviceAResource.GetPort("8080/tcp")
+	serviceAURL := fmt.Sprintf("http://%s:%s", dockerHost, serviceAPort)
+
+	// サービスAが起動するまで待機
+	if err := pool.Retry(func() error {
+		resp, err := http.Get(serviceAURL)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		return nil
+	}); err != nil {
+		t.Fatalf("could not connect to service A: %s", err)
+	}
+
+	// クライアントからサービスAにリクエスト
+	client := &http.Client{}
+	resp, err := client.Get(serviceAURL)
+	if err != nil {
+		t.Fatalf("could not make request to service A: %s", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	// レスポンスを確認
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("could not decode response: %s", err)
+	}
+
+	// サービスAからの応答に、サービスBの情報が含まれていることを確認
+	if result["service"] != "A" {
+		t.Fatalf("expected service A, got %v", result["service"])
+	}
+
+	serviceBMsg, ok := result["service_b_msg"].(string)
+	if !ok {
+		t.Fatalf("service_b_msg not found in response")
+	}
+
+	if !strings.Contains(serviceBMsg, "service B") {
+		t.Fatalf("expected service B message, got %s", serviceBMsg)
 	}
 }
